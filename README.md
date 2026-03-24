@@ -1,33 +1,120 @@
-# IrgartenGrafico
+# Irgarten
 
-A [libGDX](https://libgdx.com/) project generated with [gdx-liftoff](https://github.com/libgdx/gdx-liftoff).
+Irgarten is a 2D labyrinth game built with [libGDX](https://libgdx.com/) and Java.  
+You control a player through a grid-based maze, fight monsters, collect rewards, and try to reach the exit cell.
 
-This project was generated with a template including simple application launchers and an `ApplicationAdapter` extension that draws libGDX logo.
+The project is also designed as an OOP-focused academic project: the game logic is organized around core object-oriented principles (encapsulation, abstraction, inheritance, and polymorphism).
 
-## Platforms
+## Project Description
 
-- `core`: Main module with the application logic shared by all platforms.
-- `lwjgl3`: Primary desktop platform using LWJGL3; was called 'desktop' in older docs.
+The game is split into two main modules:
 
-## Gradle
+- `core`: game rules and domain model (`Game`, `Labyrinth`, `Player`, `Monster`, cards, combat, state).
+- `lwjgl3`: desktop launcher and runtime entrypoint for playing on PC.
 
-This project uses [Gradle](https://gradle.org/) to manage dependencies.
-The Gradle wrapper was included, so you can run Gradle tasks using `gradlew.bat` or `./gradlew` commands.
-Useful Gradle tasks and flags:
+At runtime:
 
-- `--continue`: when using this flag, errors will not stop the tasks from running.
-- `--daemon`: thanks to this flag, Gradle daemon will be used to run chosen tasks.
-- `--offline`: when using this flag, cached dependency archives will be used.
-- `--refresh-dependencies`: this flag forces validation of all dependencies. Useful for snapshot versions.
-- `build`: builds sources and archives of every project.
-- `cleanEclipse`: removes Eclipse project data.
-- `cleanIdea`: removes IntelliJ project data.
-- `clean`: removes `build` folders, which store compiled classes and built archives.
-- `eclipse`: generates Eclipse project data.
-- `idea`: generates IntelliJ project data.
-- `lwjgl3:jar`: builds application's runnable jar, which can be found at `lwjgl3/build/libs`.
-- `lwjgl3:run`: starts the application.
-- `test`: runs unit tests (if any).
+1. A maze is generated with obstacles, monsters, and one exit.
+2. The player moves one step at a time.
+3. Entering a monster cell triggers combat rounds.
+4. If the player wins, rewards are granted (weapons/shields/health).
+5. The game ends when the player reaches the exit.
 
-Note that most tasks that are not specific to a single project can be run with `name:` prefix, where the `name` should be replaced with the ID of a specific project.
-For example, `core:clean` removes `build` folder only from the `core` project.
+## Gameplay
+
+### Goal
+
+Reach the exit (`E`) while surviving combat encounters.
+
+### Controls
+
+- `WASD` or arrow keys: move.
+- `R`: restart current game.
+- `M`: mute/unmute music.
+- `F11`: toggle fullscreen.
+- `ESC`: back to menu or exit depending on current screen.
+- In menus: `O` opens settings, `ENTER` confirms/start.
+
+### Game Systems
+
+- **Difficulty presets**: `EASY`, `NORMAL`, `HARD` change maze and monster configuration.
+- **Combat**: turn-based exchange up to a max number of rounds.
+- **Rewards**: winning combat can grant weapon cards, shield cards, and health.
+- **Resurrection mechanic**: defeated players may resurrect and evolve into specialized variants (`FuzzyPlayer` or `SuperPlayer`).
+
+## OOP Concepts Used in This Project
+
+### 1) Encapsulation
+
+Classes keep internal state private and expose behavior via methods:
+
+- `GameState` stores immutable snapshot data through private final fields and getters.
+- `Game` encapsulates turn progression, combat resolution, and logging.
+- `Labyrinth` hides board update rules (`canStepOn`, `updateOldPos`, movement validation).
+
+This keeps rules centralized and prevents external classes from corrupting internal game state.
+
+### 2) Abstraction
+
+The project defines abstract bases that capture common behavior:
+
+- `LabyrinthCharacter` abstracts shared character attributes and declares `attack()`/`defend(...)`.
+- `CardDeck<T extends CombatElement>` abstracts deck behavior with a generic template and `addCards()` hook.
+
+Concrete classes only implement specifics while reusing the common contract.
+
+### 3) Inheritance
+
+Concrete entities extend abstract/specialized parents:
+
+- `Player` and `Monster` extend `LabyrinthCharacter`.
+- `FuzzyPlayer` and `SuperPlayer` extend `Player`.
+- `Weapon` and `Shield` extend `CombatElement`.
+- `WeaponCardDeck` and `ShieldCardDeck` extend `CardDeck`.
+
+Inheritance reduces duplication and models natural relationships in the game domain.
+
+### 4) Polymorphism
+
+Common method calls behave differently depending on runtime type:
+
+- `attack()` and `defend(...)` are called through the shared `LabyrinthCharacter` contract but executed with class-specific logic.
+- During resurrection, a base `Player` can be replaced by `FuzzyPlayer` or `SuperPlayer`, and gameplay continues through the same `Player` reference.
+- `CardDeck.nextCard()` works uniformly while concrete deck subclasses define how cards are created.
+
+This enables flexible gameplay behavior without changing high-level control flow.
+
+## Build and Run
+
+### Requirements
+
+- Java JDK (recommended: 17+)
+- Gradle wrapper (already included)
+
+### Run (Windows)
+
+```powershell
+.\gradlew.bat lwjgl3:run
+```
+
+### Run (macOS/Linux)
+
+```bash
+./gradlew lwjgl3:run
+```
+
+### Build
+
+```bash
+./gradlew build
+```
+
+On Windows:
+
+```powershell
+.\gradlew.bat build
+```
+
+## Assets
+
+Game art/audio files are stored in the `assets/` folder (player, monsters, walls, floor, and sound effects/music).
