@@ -19,15 +19,58 @@ import com.badlogic.gdx.math.MathUtils;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * PRESENTATION layer: bridge between the game logic ({@link Game}, {@link GameState})
+ * and the libGDX graphics API. NO game rule is decided here — we just draw what
+ * the model says and translate the user's keystrokes into calls to Game.nextStep.
+ *
+ * EXPLICIT INHERITANCE from an external library:
+ *   {@code extends ApplicationAdapter} from libGDX.
+ * ApplicationAdapter is an abstract class from libGDX that implements the lifecycle
+ * methods (create, render, dispose, resize, pause, resume) as empty by default.
+ * We override the ones we care about — "Template Method" pattern brought into the
+ * framework: libGDX calls our methods at the appropriate time.
+ *
+ * core/lwjgl3 SEPARATION — key for defending the architecture:
+ *   - The {@code core} module contains the pure logic (Game, Player, Labyrinth…) and this
+ *     presentation class, without knowing ANYTHING about the operating system.
+ *   - The {@code lwjgl3} module is just the desktop launcher. It launches MainGame and nothing else.
+ *   - MainGame consumes Game's PUBLIC API (nextStep, getGameState, finished,
+ *     getCurrentPlayer, getMonstersDebugLines) and never touches internal attributes.
+ *   - This is the clean "model / presentation / platform" boundary.
+ *
+ * COMPOSITION over inheritance:
+ *   MainGame HAS a {@link Game} ({@code miJuego}). It does NOT extend Game. This avoids coupling
+ *   the presentation with the game logic and allows changing the UI without touching the model.
+ *
+ * Implicit State pattern:
+ *   The {@link ScreenState} enumeration (START, SETTINGS, PLAYING, VICTORY) acts as the
+ *   UI state; the {@link #render()} method delegates to different drawing and input
+ *   routines based on the state, which in practice is a simplified version of the
+ *   State pattern (no class per state, just a switch in the loop).
+ *
+ * OOP concepts illustrated:
+ *  - Inheritance from a library abstract class (ApplicationAdapter)
+ *  - Composition (MainGame has a Game)
+ *  - Lifecycle method overriding
+ *  - Encapsulation of graphic resources (all private)
+ *  - Enumeration as UI finite state (implicit State pattern)
+ *  - Clear model/view separation
+ */
 public class MainGame extends ApplicationAdapter {
 
+    /**
+     * UI screen states. The render() of the main loop picks what to draw and what input
+     * to process based on the current value. It is the basis of the implicit State pattern.
+     */
     private enum ScreenState {
-        START,
-        SETTINGS,
-        PLAYING,
-        VICTORY
+        START,      // welcome screen
+        SETTINGS,   // options screen
+        PLAYING,    // game in progress
+        VICTORY     // game won
     }
 
+    // ---- Layout constants. private static final = immutable and shared by the class. ----
     private static final int TOP_MARGIN = 26;
     private static final int BOTTOM_MARGIN = 22;
     private static final int LEFT_MARGIN = 26;
@@ -35,25 +78,30 @@ public class MainGame extends ApplicationAdapter {
     private static final int MIN_RIGHT_PANEL_WIDTH = 320;
     private static final int PANEL_PADDING = 18;
 
-    private static final float PLAYER_LERP = 0.20f;
-    private static final float MOVE_PULSE_DURATION = 0.24f;
-    private static final float COMBAT_FLASH_DURATION = 0.24f;
-    private static final float SHAKE_DURATION = 0.16f;
+    // Animation constants: movement smoothing factor and effect durations.
+    private static final float PLAYER_LERP = 0.20f;          // 0..1 — how much it approaches the target each frame
+    private static final float MOVE_PULSE_DURATION = 0.24f;  // seconds of the visual pulse on move
+    private static final float COMBAT_FLASH_DURATION = 0.24f;// seconds of the red flash in combat
+    private static final float SHAKE_DURATION = 0.16f;       // seconds of camera "shake"
 
-    private Game miJuego;
-    private SpriteBatch batch;
-    private BitmapFont font;
-    private GlyphLayout glyphLayout;
+    // ---- COMPOSITION: MainGame HAS a Game. It does not inherit from it. ----
+    private Game miJuego;                // the game model
+    private SpriteBatch batch;           // libGDX: groups draw calls for performance
+    private BitmapFont font;             // typography
+    private GlyphLayout glyphLayout;     // measures text width to center/split
 
+    // Mandatory textures (loaded from assets/)
     private Texture texturaMuro;
     private Texture texturaSuelo;
     private Texture texturaSalida;
     private Texture texturaCombate;
 
+    // Animations per frame. final List → the list is not reassigned, but its content is filled in create().
     private final List<Texture> playerFrames = new ArrayList<>();
     private final List<Texture> monsterFrames = new ArrayList<>();
-    private final List<Texture> ownedTextures = new ArrayList<>();
+    private final List<Texture> ownedTextures = new ArrayList<>(); // all textures to release in dispose()
 
+    // Textures generated in code (solid color rectangles).
     private Texture texPixel;
     private Texture fondoGradiente;
     private Texture panelFondo;
@@ -66,42 +114,59 @@ public class MainGame extends ApplicationAdapter {
     private Texture botonHover;
     private Texture fondoPantalla;
 
+    // Audio resources. They can be null if the files do not exist (optional loading).
     private Sound sonidoMover;
     private Sound sonidoGolpe;
     private Sound sonidoVictoria;
     private Sound sonidoMuerteMonstruo;
     private Music musicaAmbiente;
 
+    // Player avatar animation state: current interpolated position vs. logical target.
     private float playerDrawX;
     private float playerDrawY;
     private float playerTargetX;
     private float playerTargetY;
-    private boolean playerVisualInitialized = false;
+    private boolean playerVisualInitialized = false; // false until we know its first cell
 
+    // Visual effect timers: they count down to 0 every frame.
     private float combatFlashTimer = 0f;
     private float movePulseTimer = 0f;
     private float shakeTimer = 0f;
     private float shakeX = 0f;
     private float shakeY = 0f;
 
-    private float stateTime = 0f;
-    private boolean victorySoundPlayed = false;
+    private float stateTime = 0f;             // accumulated time for cyclic animations (sin/cos)
+    private boolean victorySoundPlayed = false; // guarantees the victory sound plays only once
 
+    // Initial UI state. It will change to PLAYING when the user presses Enter.
     private ScreenState screenState = ScreenState.START;
 
+    // Geometry of the "Close game" button (reused across screens).
     private float closeButtonX;
     private float closeButtonY;
     private final float closeButtonW = 180;
     private final float closeButtonH = 48;
 
+    // Options configurable from the SETTINGS menu.
     private float uiScale = 1.0f;
     private float musicVolume = 0.30f;
     private float sfxVolume = 0.75f;
     private boolean fullscreenEnabled = true;
     private Game.GameDifficulty selectedDifficulty = Game.GameDifficulty.NORMAL;
 
-    private int settingsIndex = 0;
+    private int settingsIndex = 0; // which menu option is selected
 
+    // ============================================================================
+    //  libGDX LIFECYCLE (ApplicationAdapter overrides)
+    // ============================================================================
+
+    /**
+     * libGDX lifecycle initialization hook. The framework calls it ONCE after
+     * creating the window and before the first render. Here we load all resources
+     * (textures, fonts, sounds) and start a game.
+     *
+     * Overriding: ApplicationAdapter.create() is empty by default; we fill it in.
+     */
     @Override
     public void create() {
         batch = new SpriteBatch();
@@ -109,10 +174,12 @@ public class MainGame extends ApplicationAdapter {
         glyphLayout = new GlyphLayout();
         setFontScale(1.0f);
 
+        // Loading of sprites from classpath files
         cargarSprites();
         texturaMuro = cargarTexturaObligatoria("muro.png");
         texturaSuelo = cargarTexturaObligatoria("suelo.png");
 
+        // Flat textures generated in memory (lighter than loading PNGs for solid colors)
         texPixel = crearTexturaColor(2, 2, 1f, 1f, 1f, 1f);
         texturaSalida = crearTexturaColor(32, 32, 0.2f, 0.9f, 0.22f, 1f);
         texturaCombate = crearTexturaColor(32, 32, 1f, 0.18f, 0.18f, 0.6f);
@@ -130,11 +197,15 @@ public class MainGame extends ApplicationAdapter {
         fondoPantalla = crearTexturaColor(16, 16, 0.05f, 0.07f, 0.11f, 1f);
 
         cargarSonidos();
-        iniciarNuevaPartida();
+        iniciarNuevaPartida();                       // builds the first Game
         fullscreenEnabled = Gdx.graphics.isFullscreen();
         screenState = ScreenState.START;
     }
 
+    /**
+     * Loads the player's main sprite (mandatory) and the optional variants to
+     * animate it. Same pattern for monsters: a base texture and several variants.
+     */
     private void cargarSprites() {
         Texture jugador = cargarTexturaObligatoria("jugador.png");
         registrarTextura(jugador);
@@ -150,6 +221,7 @@ public class MainGame extends ApplicationAdapter {
         registrarTextura(monstruoBase);
         monsterFrames.add(monstruoBase);
 
+        // Variants loop: each extra PNG adds an animation frame if it exists.
         String[] variantes = { "monstruo1.png", "monstruo2.png", "monstruo3.png" };
         for (String nombre : variantes) {
             Texture frame = cargarTexturaOpcional(nombre);
@@ -160,12 +232,20 @@ public class MainGame extends ApplicationAdapter {
         }
     }
 
+    /** Registers a texture to release it in dispose(); avoids double registrations. */
     private void registrarTextura(Texture texture) {
         if (texture != null && !ownedTextures.contains(texture)) {
             ownedTextures.add(texture);
         }
     }
 
+    /**
+     * Builds a NEW Game (the only way to restart the match).
+     * Also resets the visual timers and the victory sound flag.
+     *
+     * Composition in action: this is where the model is instantiated. If MainGame inherited
+     * from Game, this would be impossible — we could not change the game without changing the UI.
+     */
     private void iniciarNuevaPartida() {
         miJuego = new Game(1, selectedDifficulty);
         playerVisualInitialized = false;
@@ -175,12 +255,17 @@ public class MainGame extends ApplicationAdapter {
         shakeTimer = 0f;
     }
 
+    // ============================================================================
+    //  AUDIO RESOURCE LOADING (optional — the app works without sound)
+    // ============================================================================
+
     private void cargarSonidos() {
         sonidoMover = cargarSonidoSiExiste("move.mp3");
         sonidoGolpe = cargarSonidoSiExiste("hit.mp3");
         sonidoVictoria = cargarSonidoSiExiste("win.mp3");
         sonidoMuerteMonstruo = cargarSonidoSiExiste("monster_dead.mp3");
 
+        // Accepts several alternative names for the ambient music.
         musicaAmbiente = cargarMusicaSiExiste("ambient.mp3", "ambiente.mp3", "music.mp3");
         aplicarVolumenMusica();
     }
@@ -193,6 +278,10 @@ public class MainGame extends ApplicationAdapter {
         return Gdx.audio.newSound(file);
     }
 
+    /**
+     * Loads the FIRST music found among several candidate names.
+     * Use of varargs ({@code String...}) to keep the call flexible.
+     */
     private Music cargarMusicaSiExiste(String... nombres) {
         for (String nombre : nombres) {
             FileHandle file = Gdx.files.internal(nombre);
@@ -215,6 +304,7 @@ public class MainGame extends ApplicationAdapter {
         }
     }
 
+    /** Helper to play effects respecting the global SFX volume. */
     private void reproducir(Sound sonido, float volumen, float pitch) {
         if (sonido != null) {
             sonido.play(volumen * sfxVolume, pitch, 0f);
@@ -237,6 +327,10 @@ public class MainGame extends ApplicationAdapter {
         return new Texture(file);
     }
 
+    /**
+     * Creates a solid one-color texture using a Pixmap. Useful for buttons and panels.
+     * Important: the Pixmap is released after uploading data to GPU; we only keep the Texture.
+     */
     private Texture crearTexturaColor(int width, int height, float r, float g, float b, float a) {
         Pixmap pixmap = new Pixmap(width, height, Pixmap.Format.RGBA8888);
         pixmap.setColor(r, g, b, a);
@@ -246,6 +340,25 @@ public class MainGame extends ApplicationAdapter {
         return texture;
     }
 
+    // ============================================================================
+    //  MAIN LOOP — render() (called by libGDX ~60 times/second)
+    // ============================================================================
+
+    /**
+     * Main game loop. libGDX invokes it every frame.
+     *
+     * Structure:
+     *  1. Updates time and effect timers.
+     *  2. Processes GLOBAL input (ESC, F11, close click) — valid in any state.
+     *  3. Clears the screen.
+     *  4. Opens the batch (libGDX groups draw calls).
+     *  5. Draws the background and delegates to the corresponding screen based on screenState.
+     *     This switch embodies the "implicit State pattern": each state has its own
+     *     drawing and its own input processing.
+     *  6. Closes the batch.
+     *
+     * Overriding of ApplicationAdapter's empty render().
+     */
     @Override
     public void render() {
         float delta = Gdx.graphics.getDeltaTime();
@@ -259,6 +372,7 @@ public class MainGame extends ApplicationAdapter {
         batch.begin();
         dibujarFondoDinamico();
 
+        // Dispatch by state: this is where the "implicit State pattern" makes sense.
         if (screenState == ScreenState.START) {
             dibujarPantallaInicio();
         } else if (screenState == ScreenState.SETTINGS) {
@@ -267,6 +381,7 @@ public class MainGame extends ApplicationAdapter {
         } else if (screenState == ScreenState.PLAYING) {
             gestionarInputJuego();
 
+            // Model polling: if the game has ended, state transition.
             if (miJuego.finished()) {
                 screenState = ScreenState.VICTORY;
             }
@@ -279,7 +394,7 @@ public class MainGame extends ApplicationAdapter {
         } else if (screenState == ScreenState.VICTORY) {
             if (!victorySoundPlayed) {
                 reproducir(sonidoVictoria, 0.85f, 1f);
-                victorySoundPlayed = true;
+                victorySoundPlayed = true; // guarantees the jingle plays ONCE per victory
             }
             dibujarPantallaVictoria();
         }
@@ -287,6 +402,10 @@ public class MainGame extends ApplicationAdapter {
         batch.end();
     }
 
+    /**
+     * Decrements all visual effect timers (flash, pulse, shake) by delta.
+     * While the shake is active, generates random offsets to simulate the rattle.
+     */
     private void actualizarTimers(float delta) {
         if (combatFlashTimer > 0f) {
             combatFlashTimer -= delta;
@@ -304,6 +423,7 @@ public class MainGame extends ApplicationAdapter {
 
         if (shakeTimer > 0f) {
             shakeTimer -= delta;
+            // Shake intensity decays linearly with the remaining time.
             float intensity = 6f * (shakeTimer / SHAKE_DURATION);
             shakeX = MathUtils.random(-intensity, intensity);
             shakeY = MathUtils.random(-intensity, intensity);
@@ -314,8 +434,17 @@ public class MainGame extends ApplicationAdapter {
         }
     }
 
+    // ============================================================================
+    //  INPUT HANDLING (keyboard and mouse)
+    // ============================================================================
+
+    /**
+     * GLOBAL input (valid in any screen): ESC navigates back or exits,
+     * F11 toggles fullscreen, click on the close button terminates the app.
+     */
     private void gestionarInputGlobal() {
         if (Gdx.input.isKeyJustPressed(Input.Keys.ESCAPE)) {
+            // ESC depends on context: from SETTINGS go back to the menu; from START or VICTORY exit; from PLAYING go back to the menu.
             if (screenState == ScreenState.SETTINGS) {
                 screenState = ScreenState.START;
             } else if (screenState == ScreenState.START || screenState == ScreenState.VICTORY) {
@@ -334,6 +463,15 @@ public class MainGame extends ApplicationAdapter {
         }
     }
 
+    /**
+     * Input during the match. Translates directional keys into calls to {@link Game#nextStep}.
+     * HERE is the UI → model boundary: the only information the UI passes to the model is
+     * a {@link Directions}. The whole decision about what happens with that direction is made by Game.
+     *
+     * After a movement, fires visual/audio effects depending on the substrings that appear
+     * in the log. It is coupling by convention (log substring searches are fragile), but
+     * MainGame does not decide any outcome: it only reacts.
+     */
     private void gestionarInputJuego() {
         if (Gdx.input.isKeyJustPressed(Input.Keys.R)) {
             iniciarNuevaPartida();
@@ -342,6 +480,7 @@ public class MainGame extends ApplicationAdapter {
 
         boolean moved = false;
 
+        // Each directional or WASD key is translated into a nextStep call with the direction.
         if (Gdx.input.isKeyJustPressed(Input.Keys.UP) || Gdx.input.isKeyJustPressed(Input.Keys.W)) {
             miJuego.nextStep(Directions.UP);
             moved = true;
@@ -356,12 +495,15 @@ public class MainGame extends ApplicationAdapter {
             moved = true;
         }
 
+        // M key: quickly mutes/activates the music.
         if (Gdx.input.isKeyJustPressed(Input.Keys.M)) {
             musicVolume = musicVolume > 0.01f ? 0f : 0.30f;
             aplicarVolumenMusica();
         }
 
         if (moved) {
+            // Inspects the log returned by the model to decide which effects to fire.
+            // The model is the "source of truth"; the UI only reacts to its messages.
             String log = miJuego.getLastLog();
             movePulseTimer = MOVE_PULSE_DURATION;
 
@@ -380,9 +522,14 @@ public class MainGame extends ApplicationAdapter {
             }
         }
     }
+
+    /**
+     * Input specific to the SETTINGS screen: navigates between options with arrows/WASD
+     * and adjusts values with left/right. It is an elementary "vertical menu".
+     */
     private void gestionarInputOpciones() {
         if (Gdx.input.isKeyJustPressed(Input.Keys.UP) || Gdx.input.isKeyJustPressed(Input.Keys.W)) {
-            settingsIndex = (settingsIndex + 4) % 5;
+            settingsIndex = (settingsIndex + 4) % 5; // up (with wrap-around modulo 5)
         }
 
         if (Gdx.input.isKeyJustPressed(Input.Keys.DOWN) || Gdx.input.isKeyJustPressed(Input.Keys.S)) {
@@ -397,6 +544,7 @@ public class MainGame extends ApplicationAdapter {
             ajustarOpcionActual(1);
         }
 
+        // ENTER on the "Back" option returns to the main menu.
         if (Gdx.input.isKeyJustPressed(Input.Keys.ENTER)) {
             if (settingsIndex == 4) {
                 screenState = ScreenState.START;
@@ -404,6 +552,10 @@ public class MainGame extends ApplicationAdapter {
         }
     }
 
+    /**
+     * Applies a +/-1 adjustment to the selected option. Ranges are constrained with clamp.
+     * Changing difficulty restarts the match (Game is rebuilt with the new parameters).
+     */
     private void ajustarOpcionActual(int dir) {
         if (settingsIndex == 0) {
             uiScale = MathUtils.clamp(uiScale + dir * 0.05f, 0.80f, 1.35f);
@@ -413,6 +565,7 @@ public class MainGame extends ApplicationAdapter {
         } else if (settingsIndex == 2) {
             sfxVolume = MathUtils.clamp(sfxVolume + dir * 0.05f, 0f, 1f);
         } else if (settingsIndex == 3) {
+            // Circular traversal of the GameDifficulty enum
             int next = selectedDifficulty.ordinal() + dir;
             if (next < 0) {
                 next = Game.GameDifficulty.values().length - 1;
@@ -421,10 +574,14 @@ public class MainGame extends ApplicationAdapter {
                 next = 0;
             }
             selectedDifficulty = Game.GameDifficulty.values()[next];
-            iniciarNuevaPartida();
+            iniciarNuevaPartida(); // changing difficulty => new Game
         }
     }
 
+    /**
+     * Toggles between fullscreen and windowed. If it switches to windowed, it leaves a
+     * reasonable margin against the display so the close is visible.
+     */
     private void alternarPantallaCompleta() {
         Graphics.DisplayMode mode = Gdx.graphics.getDisplayMode();
         if (!fullscreenEnabled) {
@@ -438,12 +595,23 @@ public class MainGame extends ApplicationAdapter {
         }
     }
 
+    // ============================================================================
+    //  UI SCREENS: START, SETTINGS, VICTORY
+    //  (Each draws a "center card" with texts and buttons; they share helpers
+    //   dibujarTarjetaCentro/dibujarTextoCentrado/dibujarBotonCerrar.)
+    // ============================================================================
+
+    /**
+     * Initial screen: animated title, instructions and shortcuts. ENTER starts the match,
+     * O opens options, ESC exits. It detects those keys at the end of the method.
+     */
     private void dibujarPantallaInicio() {
         float w = Gdx.graphics.getWidth();
         float h = Gdx.graphics.getHeight();
         float centerX = w * 0.5f;
         float centerY = h * 0.5f;
 
+        // Computes the center card size responsively.
         float cardW = Math.min(760f, w - 80f);
         float cardH = Math.min(520f, h - 70f);
         float cardX = centerX - cardW * 0.5f;
@@ -455,6 +623,7 @@ public class MainGame extends ApplicationAdapter {
 
         float y = cardY + cardH - 56f;
 
+        // "IRGARTEN" title with oscillating scale (heartbeat) using sin(t).
         font.setColor(Color.GOLD);
         setFontScale((1.85f + 0.08f * MathUtils.sin(stateTime * 2.2f)) * compact);
         dibujarTextoCentrado("IRGARTEN", centerX, y);
@@ -482,9 +651,11 @@ public class MainGame extends ApplicationAdapter {
 
         setFontScale(1.0f);
 
+        // The "Close game" button is anchored relative to the card.
         float closeY = Math.max(cardY + 22f, y - 72f);
         dibujarBotonCerrar(centerX - closeButtonW * 0.5f, closeY, "Cerrar juego");
 
+        // Transitions from the initial screen.
         if (Gdx.input.isKeyJustPressed(Input.Keys.ENTER)) {
             iniciarNuevaPartida();
             screenState = ScreenState.PLAYING;
@@ -495,6 +666,11 @@ public class MainGame extends ApplicationAdapter {
         }
     }
 
+    /**
+     * OPTIONS screen. Draws a vertical menu with labels and values; highlights the selected
+     * row. The actual changes are applied by {@link #gestionarInputOpciones()} →
+     * {@link #ajustarOpcionActual(int)}.
+     */
     private void dibujarPantallaOpciones() {
         float w = Gdx.graphics.getWidth();
         float h = Gdx.graphics.getHeight();
@@ -516,6 +692,7 @@ public class MainGame extends ApplicationAdapter {
         y -= 70f;
         setFontScale(1.05f);
 
+        // Parallel listing of labels and values. The index marks which one is selected.
         String[] labels = {
                 "Escala UI",
                 "Volumen musica",
@@ -532,6 +709,7 @@ public class MainGame extends ApplicationAdapter {
                 "ENTER"
         };
 
+        // Each row: if selected, a background highlight is drawn and the label in SKY.
         for (int i = 0; i < labels.length; i++) {
             boolean selected = i == settingsIndex;
             if (selected) {
@@ -554,6 +732,7 @@ public class MainGame extends ApplicationAdapter {
         dibujarBotonCerrar(centerX - closeButtonW * 0.5f, cardY + 18f, "Cerrar juego");
     }
 
+    /** Translates the {@link Game.GameDifficulty} enum into a friendly label for the menu. */
     private String dificultadTexto(Game.GameDifficulty difficulty) {
         if (difficulty == Game.GameDifficulty.EASY) {
             return "Facil";
@@ -564,6 +743,11 @@ public class MainGame extends ApplicationAdapter {
         return "Normal";
     }
 
+    /**
+     * VICTORY screen. Shows player summary (final health, weapons, shields) and
+     * shortcuts to restart/open options/exit. Reads the player state through
+     * Game's public API ({@link Game#getCurrentPlayer()}).
+     */
     private void dibujarPantallaVictoria() {
         float w = Gdx.graphics.getWidth();
         float h = Gdx.graphics.getHeight();
@@ -590,6 +774,8 @@ public class MainGame extends ApplicationAdapter {
         dibujarTextoCentrado("Has llegado a la salida y completado la partida.", centerX, y);
         y -= 52f;
 
+        // Player summary: polymorphism on display — getName() / getHealth() / weaponsInfo()
+        // work the same whether the real instance is Player, FuzzyPlayer or SuperPlayer.
         Player jugador = miJuego.getCurrentPlayer();
         if (jugador != null) {
             font.setColor(Color.CYAN);
@@ -620,6 +806,7 @@ public class MainGame extends ApplicationAdapter {
         setFontScale(1.0f);
         dibujarBotonCerrar(centerX - closeButtonW * 0.5f, cardY + 22f, "Cerrar juego");
 
+        // Transitions from the victory screen.
         if (Gdx.input.isKeyJustPressed(Input.Keys.ENTER)) {
             iniciarNuevaPartida();
             screenState = ScreenState.PLAYING;
@@ -629,6 +816,22 @@ public class MainGame extends ApplicationAdapter {
             screenState = ScreenState.SETTINGS;
         }
     }
+
+    // ============================================================================
+    //  LABYRINTH DRAWING DURING A MATCH
+    // ============================================================================
+
+    /**
+     * Translates the model's {@code char[][]} into pixels: traverses the matrix and for each
+     * cell draws floor, wall, exit, monster or combat. The player is NOT painted on the grid
+     * directly but via an interpolated sprite (playerDrawX/Y) to animate the movement.
+     *
+     * Concepts to highlight:
+     *  - The UI consumes the model's snapshot (matrix of characters) and does NOT know the
+     *    Player/Monster classes: it only sees the character codes. This demonstrates the decoupling.
+     *  - Linear interpolation (lerp): each frame, the visible position approaches the logical
+     *    position by PLAYER_LERP percent. It gives the feel of smooth movement.
+     */
     private void dibujarLaberinto() {
         Labyrinth lab = miJuego.getLabyrinth();
         char[][] mapa = lab.getMatrix();
@@ -640,17 +843,19 @@ public class MainGame extends ApplicationAdapter {
         int altoVentana = Gdx.graphics.getHeight();
         int panelWidth = getRightPanelWidth();
 
+        // Reserves space for the side panel and margins; computes the cell size that fits.
         int anchoDisponible = anchoVentana - panelWidth - LEFT_MARGIN * 2;
         int altoDisponible = altoVentana - TOP_MARGIN - BOTTOM_MARGIN;
 
         int tamCasilla = Math.min(anchoDisponible / cols, altoDisponible / filas);
         if (tamCasilla < 12) {
-            tamCasilla = 12;
+            tamCasilla = 12; // minimum size so something is still visible
         }
 
         int anchoTablero = tamCasilla * cols;
         int altoTablero = tamCasilla * filas;
 
+        // We apply the "shake" offset only to the board, not the panel.
         int offsetX = LEFT_MARGIN + (anchoDisponible - anchoTablero) / 2 + Math.round(shakeX);
         int offsetY = BOTTOM_MARGIN + (altoDisponible - altoTablero) / 2 + Math.round(shakeY);
 
@@ -659,23 +864,28 @@ public class MainGame extends ApplicationAdapter {
 
         dibujarMarcoTablero(offsetX, offsetY, anchoTablero, altoTablero);
 
+        // Double loop: for each cell decides which texture to paint based on its character.
         for (int fila = 0; fila < filas; fila++) {
             for (int col = 0; col < cols; col++) {
                 int x = offsetX + col * tamCasilla;
+                // libGDX uses origin at lower-left corner, so we invert the row.
                 int y = offsetY + (filas - 1 - fila) * tamCasilla;
 
                 char celda = mapa[fila][col];
 
+                // Checker pattern with sinusoidal pulse to give the floor some life.
                 float checker = ((fila + col) % 2 == 0) ? 0.95f : 0.85f;
                 float pulse = 0.04f * MathUtils.sin(stateTime * 1.7f + fila * 0.5f + col * 0.4f);
                 batch.setColor(checker + pulse, checker + pulse, checker + pulse, 1f);
                 batch.draw(texturaSuelo, x, y, tamCasilla, tamCasilla);
                 batch.setColor(Color.WHITE);
 
+                // Dispatch by cell character: equivalent to a mini visual switch.
                 if (celda == 'X') {
                     dibujarSombra(x, y, tamCasilla, 0.18f);
                     batch.draw(texturaMuro, x, y, tamCasilla, tamCasilla);
                 } else if (celda == 'E') {
+                    // Exit with pulsing glow.
                     float exitPulse = 0.68f + 0.30f * MathUtils.sin(stateTime * 3f);
                     batch.setColor(1f, 1f, 1f, exitPulse);
                     batch.draw(texturaSalida, x, y, tamCasilla, tamCasilla);
@@ -684,10 +894,12 @@ public class MainGame extends ApplicationAdapter {
                             tamCasilla * 1.28f);
                     batch.setColor(Color.WHITE);
                 } else if (celda == 'M') {
+                    // Monster with slight vertical "bobbing" (sinusoid).
                     float bob = 2f * MathUtils.sin(stateTime * 4f + fila + col);
                     dibujarSombra(x, y, tamCasilla, 0.26f);
                     batch.draw(getMonsterFrame(), x, y + bob, tamCasilla, tamCasilla);
                 } else if (celda == 'C') {
+                    // Combat: monster + red tint. We note this cell as the player's position.
                     float bob = 1.5f * MathUtils.sin(stateTime * 5f + fila + col);
                     dibujarSombra(x, y, tamCasilla, 0.30f);
                     batch.draw(getMonsterFrame(), x, y + bob, tamCasilla, tamCasilla);
@@ -695,12 +907,14 @@ public class MainGame extends ApplicationAdapter {
                     playerRow = fila;
                     playerCol = col;
                 } else if (Character.isDigit(celda)) {
+                    // Cell with digit = player position. We note it to draw it separately (interpolated).
                     playerRow = fila;
                     playerCol = col;
                 }
             }
         }
 
+        // Player sprite: logical position → target pixel position → interpolation.
         if (playerRow != -1 && playerCol != -1) {
             float targetX = offsetX + playerCol * tamCasilla;
             float targetY = offsetY + (filas - 1 - playerRow) * tamCasilla;
@@ -709,14 +923,17 @@ public class MainGame extends ApplicationAdapter {
             playerTargetY = targetY;
 
             if (!playerVisualInitialized) {
+                // First time we know where it is: we plant it there without interpolating.
                 playerDrawX = playerTargetX;
                 playerDrawY = playerTargetY;
                 playerVisualInitialized = true;
             } else {
+                // Smoothed lerp: each frame we get PLAYER_LERP closer to the target.
                 playerDrawX += (playerTargetX - playerDrawX) * PLAYER_LERP;
                 playerDrawY += (playerTargetY - playerDrawY) * PLAYER_LERP;
             }
 
+            // Scale pulse on movement + constant sinusoidal bobbing.
             float pulse = movePulseTimer > 0f ? 1f + 0.20f * (movePulseTimer / MOVE_PULSE_DURATION) : 1f;
             float drawSize = tamCasilla * pulse;
             float shift = (drawSize - tamCasilla) * 0.5f;
@@ -727,15 +944,20 @@ public class MainGame extends ApplicationAdapter {
         }
     }
 
+    /**
+     * Returns the player frame for this time instant. While moving, the animation speed
+     * accelerates (more sense of marching).
+     */
     private Texture getPlayerFrame() {
         if (playerFrames.isEmpty()) {
-            return texturaSuelo;
+            return texturaSuelo; // fallback: should not occur if assets are right
         }
         float speed = movePulseTimer > 0f ? 12f : 5f;
         int index = (int) (stateTime * speed) % playerFrames.size();
         return playerFrames.get(index);
     }
 
+    /** Returns the monster frame for this time instant (constant animation). */
     private Texture getMonsterFrame() {
         if (monsterFrames.isEmpty()) {
             return texturaSuelo;
@@ -744,6 +966,12 @@ public class MainGame extends ApplicationAdapter {
         return monsterFrames.get(index);
     }
 
+    // ============================================================================
+    //  REUSABLE DRAWING HELPERS (background, frames, glows, bars, flash)
+    //  They are "pure presentation" auxiliary methods: they do not touch the model.
+    // ============================================================================
+
+    /** Screen background with strips that scroll creating a depth feel. */
     private void dibujarFondoDinamico() {
         float w = Gdx.graphics.getWidth();
         float h = Gdx.graphics.getHeight();
@@ -754,11 +982,13 @@ public class MainGame extends ApplicationAdapter {
         batch.draw(fondoGradiente, 0, h * 0.36f, w, h * 0.64f);
         batch.setColor(Color.WHITE);
 
+        // Bright strips that scroll laterally with stateTime → cyclic animation.
         float stripAlpha = 0.04f + 0.03f * MathUtils.sin(stateTime * 0.7f);
         dibujarBrillo(-120 + (stateTime * 28f) % (w + 240f), h * 0.62f, w * 0.52f, 80f, stripAlpha);
         dibujarBrillo(w - ((stateTime * 36f) % (w + 220f)), h * 0.22f, w * 0.44f, 66f, stripAlpha * 1.1f);
     }
 
+    /** Dark frame behind the board with a subtle light line on top. */
     private void dibujarMarcoTablero(float x, float y, float w, float h) {
         batch.draw(marcoTablero, x - 16, y - 16, w + 32, h + 32);
         batch.setColor(0.65f, 0.80f, 1f, 0.12f);
@@ -766,6 +996,7 @@ public class MainGame extends ApplicationAdapter {
         batch.setColor(Color.WHITE);
     }
 
+    /** Center card used by START/SETTINGS/VICTORY screens: dark background + top bar. */
     private void dibujarTarjetaCentro(float x, float y, float w, float h) {
         batch.draw(panelFondo, x, y, w, h);
         batch.setColor(0.6f, 0.78f, 1f, 0.14f);
@@ -773,18 +1004,21 @@ public class MainGame extends ApplicationAdapter {
         batch.setColor(Color.WHITE);
     }
 
+    /** Flat elliptical shadow under characters/walls to give visual weight. */
     private void dibujarSombra(float x, float y, float tam, float alpha) {
         batch.setColor(0f, 0f, 0f, alpha);
         batch.draw(texPixel, x + tam * 0.18f, y + tam * 0.05f, tam * 0.64f, tam * 0.18f);
         batch.setColor(Color.WHITE);
     }
 
+    /** Semi-transparent bluish band, reused in headers and background. */
     private void dibujarBrillo(float x, float y, float w, float h, float alpha) {
         batch.setColor(0.72f, 0.90f, 1f, alpha);
         batch.draw(texPixel, x, y, w, h);
         batch.setColor(Color.WHITE);
     }
 
+    /** Full-screen red flash during a combat; opacity decays with the timer. */
     private void dibujarFlashCombate() {
         float alpha = combatFlashTimer / COMBAT_FLASH_DURATION;
         batch.setColor(1f, 0.15f, 0.15f, 0.18f * alpha);
@@ -792,6 +1026,7 @@ public class MainGame extends ApplicationAdapter {
         batch.setColor(Color.WHITE);
     }
 
+    /** Generic health bar: background + fill proportional to current/max ratio. */
     private void dibujarBarraVida(float x, float y, float width, float height, float current, float max,
             Texture barTexture) {
         batch.draw(barraFondo, x, y, width, height);
@@ -807,6 +1042,18 @@ public class MainGame extends ApplicationAdapter {
         batch.draw(barTexture, x, y, width * ratio, height);
     }
 
+    // ============================================================================
+    //  RIGHT SIDE PANEL (information about the match in progress)
+    // ============================================================================
+
+    /**
+     * Side panel with instructions, last log, current player data and the list
+     * of alive monsters. It is the most visible face of the UI ↔ model boundary: each text
+     * block is obtained by ASKING the model (getLastLog, getCurrentPlayer, getMonstersDebugLines).
+     *
+     * Implements "skip if it does not fit": if the Y cursor falls below a threshold,
+     * the drawing is interrupted so we do not overflow the panel.
+     */
     private void dibujarPanelDerecho() {
         int anchoVentana = Gdx.graphics.getWidth();
         int altoVentana = Gdx.graphics.getHeight();
@@ -815,6 +1062,7 @@ public class MainGame extends ApplicationAdapter {
         int panelX = anchoVentana - panelWidth;
         batch.draw(panelFondo, panelX, 0, panelWidth, altoVentana);
 
+        // Decorative top band.
         batch.setColor(0.60f, 0.75f, 1f, 0.12f);
         batch.draw(panelFondoClaro, panelX + 12, altoVentana - 74, panelWidth - 24, 36);
         batch.setColor(Color.WHITE);
@@ -824,6 +1072,7 @@ public class MainGame extends ApplicationAdapter {
         float y = altoVentana - 24;
         float line = 24f * uiScale;
 
+        // Header and keyboard shortcuts.
         font.setColor(Color.WHITE);
         setFontScale(1.12f);
         font.draw(batch, "IRGARTEN // ESTADO", x, y);
@@ -840,6 +1089,7 @@ public class MainGame extends ApplicationAdapter {
         font.draw(batch, "M: Mutear musica", x, y);
         y -= line * 1.25f;
 
+        // --- "Last event" section: shows the model's log split by width. ---
         font.setColor(Color.GOLD);
         font.draw(batch, "ULTIMO EVENTO", x, y);
         y -= line;
@@ -851,7 +1101,7 @@ public class MainGame extends ApplicationAdapter {
         font.setColor(Color.WHITE);
         for (String s : dividirTextoPorAncho(miJuego.getLastLog(), panelContentWidth - 14f)) {
             if (y < 96f) {
-                break;
+                break; // protects against vertical overflow
             }
             font.draw(batch, s, x, y);
             y -= line;
@@ -859,6 +1109,8 @@ public class MainGame extends ApplicationAdapter {
 
         y -= 8;
 
+        // --- "Current player" section: polymorphism in practice. ---
+        // jugador can be Player, FuzzyPlayer or SuperPlayer: all respond to the same getters.
         Player jugador = miJuego.getCurrentPlayer();
         if (jugador != null && y > 170f) {
             font.setColor(Color.CYAN);
@@ -902,6 +1154,7 @@ public class MainGame extends ApplicationAdapter {
             y -= 8f;
         }
 
+        // --- "Monsters" section: asks the model for the pre-formatted list. ---
         if (y > 120f) {
             font.setColor(Color.SALMON);
             font.draw(batch, "MONSTRUOS", x, y);
@@ -929,11 +1182,17 @@ public class MainGame extends ApplicationAdapter {
         dibujarBotonCerrar(panelX + (panelWidth - closeButtonW) * 0.5f, 25, "Cerrar juego");
     }
 
+    /** Width of the side panel: ~33% of the window, bounded between MIN and MAX. */
     private int getRightPanelWidth() {
         int desired = Math.round(Gdx.graphics.getWidth() * 0.33f);
         return MathUtils.clamp(desired, MIN_RIGHT_PANEL_WIDTH, MAX_RIGHT_PANEL_WIDTH);
     }
 
+    /**
+     * Reusable "Close game" button. Memorizes its position in {@code closeButtonX/Y} so
+     * that {@link #clickEnBotonCerrar()} can detect the click. It is a simple way of
+     * "shared state across frames" without a separate Button class.
+     */
     private void dibujarBotonCerrar(float x, float y, String texto) {
         closeButtonX = x;
         closeButtonY = y;
@@ -952,11 +1211,19 @@ public class MainGame extends ApplicationAdapter {
         font.draw(batch, texto, closeButtonX + (closeButtonW - glyphLayout.width) * 0.5f, closeButtonY + 31f);
     }
 
+    /** Prints a text centered in X. Uses GlyphLayout to measure the actual width. */
     private void dibujarTextoCentrado(String texto, float centerX, float y) {
         glyphLayout.setText(font, texto);
         font.draw(batch, texto, centerX - glyphLayout.width * 0.5f, y);
     }
 
+    /**
+     * Own "word wrap" algorithm: splits the text into lines that do not exceed {@code maxWidth}
+     * pixels, splitting on spaces and, as a last resort, splitting inside a word too long.
+     * Returns the list of lines, ready to be printed one by one.
+     *
+     * It is a good example of string handling with StringBuilder + GlyphLayout for measurement.
+     */
     private ArrayList<String> dividirTextoPorAncho(String texto, float maxWidth) {
         ArrayList<String> lineas = new ArrayList<>();
 
@@ -969,6 +1236,7 @@ public class MainGame extends ApplicationAdapter {
         StringBuilder actual = new StringBuilder();
 
         for (String palabra : palabras) {
+            // We try adding the next word; if it exceeds the width, we close the line.
             String candidato = actual.length() == 0 ? palabra : actual + " " + palabra;
             glyphLayout.setText(font, candidato);
 
@@ -985,6 +1253,7 @@ public class MainGame extends ApplicationAdapter {
                 if (glyphLayout.width <= maxWidth) {
                     actual.append(palabra);
                 } else {
+                    // The word alone is wider than the panel: we chop it character by character.
                     String fragmento = "";
                     for (int i = 0; i < palabra.length(); i++) {
                         String siguiente = fragmento + palabra.charAt(i);
@@ -1010,29 +1279,48 @@ public class MainGame extends ApplicationAdapter {
         return lineas;
     }
 
+    /** Multiplies a base scale by the global UI scale configured in options. */
     private void setFontScale(float baseScale) {
         font.getData().setScale(baseScale * uiScale);
     }
 
+    /**
+     * Checks whether the cursor is inside a rectangle. Important: libGDX gives the mouse Y
+     * from the TOP; we invert it to align with our coordinates (origin at the bottom).
+     */
     private boolean ratonDentro(float x, float y, float w, float h) {
         float mx = Gdx.input.getX();
         float my = Gdx.graphics.getHeight() - Gdx.input.getY();
         return mx >= x && mx <= x + w && my >= y && my <= y + h;
     }
 
+    /** True if right in this frame a click has been made on the "Close game" button. */
     private boolean clickEnBotonCerrar() {
         return Gdx.input.justTouched() && ratonDentro(closeButtonX, closeButtonY, closeButtonW, closeButtonH);
     }
 
+    // ============================================================================
+    //  SHUTDOWN — dispose() releases ALL native resources
+    // ============================================================================
+
+    /**
+     * Lifecycle hook called by libGDX when the app closes. We manually release
+     * textures, fonts and sounds because they are NATIVE resources (GPU memory, audio buffers)
+     * that the JVM garbage collector does not touch.
+     *
+     * Overriding of ApplicationAdapter's empty dispose().
+     */
     @Override
     public void dispose() {
         batch.dispose();
         font.dispose();
 
+        // Textures registered in cargarSprites (the ones loaded from PNG).
         for (Texture texture : ownedTextures) {
             texture.dispose();
         }
 
+        // Mandatory textures and those generated in code.
         texturaMuro.dispose();
         texturaSuelo.dispose();
         texturaSalida.dispose();
@@ -1050,6 +1338,7 @@ public class MainGame extends ApplicationAdapter {
         botonHover.dispose();
         fondoPantalla.dispose();
 
+        // Audio (can be null if assets did not exist): we check before releasing.
         if (sonidoMover != null) {
             sonidoMover.dispose();
         }
